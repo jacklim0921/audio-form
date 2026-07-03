@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Audioform — Mic Volume & Gap Timer</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0d1117; color: #e6edf3; padding: 24px;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { font-size: 12px; color: #6e7681; margin: 0 0 16px; }
+  .panel { max-width: 980px; margin: 0 auto; }
+  button {
+    border: 1px solid #30363d; border-radius: 6px; padding: 9px 16px; font: inherit;
+    background: #21262d; color: #e6edf3; cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: #30363d; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.primary { background: #238636; border-color: #2ea043; }
+  button.danger { background: #da3633; border-color: #f85149; }
+  .controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 16px 0; }
+  .status { font-size: 12px; color: #9aa7b4; min-height: 18px; }
+  .status.err { color: #f85149; }
+  .status.ok { color: #3fb950; }
+
+  .cards { display: flex; gap: 12px; flex-wrap: wrap; margin: 16px 0; }
+  .card {
+    flex: 1 1 200px; background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .card .k { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #6e7681; }
+  .card .v { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 4px; }
+  .card .u { font-size: 13px; color: #9aa7b4; font-weight: 400; }
+  .card.gap { border-color: #1f6feb; }
+  .card.gap.live .v { color: #d29922; }
+  .card.gap.done .v { color: #58a6ff; }
+
+  .wave-wrap { margin-top: 8px; }
+  canvas { width: 100%; height: 200px; display: block; background: #010409;
+           border: 1px solid #30363d; border-radius: 8px; }
+  .wave-label { font-size: 12px; font-weight: 600; margin-bottom: 4px; color: #58a6ff; }
+
+  .sliders { display: flex; gap: 24px; flex-wrap: wrap; margin: 14px 0; }
+  .slider { display: flex; flex-direction: column; gap: 4px; flex: 1 1 240px; }
+  .slider label { font-size: 12px; color: #9aa7b4; }
+  .slider .val { color: #e6edf3; font-variant-numeric: tabular-nums; }
+  input[type=range] { width: 100%; }
+  .pill { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px;
+          border: 1px solid #30363d; font-variant-numeric: tabular-nums; }
+  .pill.spk { background: #3fb95022; border-color: #3fb950; color: #3fb950; }
+  .pill.sil { background: #d2992222; border-color: #d29922; color: #d29922; }
+  table { border-collapse: collapse; width: 100%; margin-top: 12px; font-size: 13px; }
+  th, td { text-align: right; padding: 6px 10px; border-bottom: 1px solid #21262d; font-variant-numeric: tabular-nums; }
+  th { color: #6e7681; font-weight: 600; text-align: right; }
+  th:first-child, td:first-child { text-align: left; }
+</style>
+</head>
+<body>
+<div class="panel">
+  <h1>Audioform</h1>
+  <p class="sub">Mic volume monitor + gap timer — measures the time between the last volume‑down and the first new volume‑up.</p>
+
+  <div class="controls">
+    <button id="start" class="primary">🎙️ Start mic</button>
+    <button id="stop" class="danger" disabled>Stop</button>
+    <button id="reset" disabled>Reset</button>
+    <span style="flex:1"></span>
+    <span id="state" class="pill">idle</span>
+    <span id="level" class="pill">level —</span>
+  </div>
+
+  <div id="status" class="status"></div>
+
+  <div class="cards">
+    <div class="card gap" id="gapCard">
+      <div class="k">Current gap</div>
+      <div class="v"><span id="gapVal">—</span><span class="u"> ms</span></div>
+    </div>
+    <div class="card">
+      <div class="k">Last gap</div>
+      <div class="v"><span id="lastGap">—</span><span class="u"> ms</span></div>
+    </div>
+    <div class="card">
+      <div class="k">Shortest / Longest</div>
+      <div class="v" style="font-size:22px;"><span id="minGap">—</span><span class="u"> / </span><span id="maxGap">—</span><span class="u"> ms</span></div>
+    </div>
+    <div class="card">
+      <div class="k">Gaps measured</div>
+      <div class="v"><span id="count">0</span></div>
+    </div>
+  </div>
+
+  <div class="sliders">
+    <div class="slider">
+      <label>Speech threshold — <span class="val" id="thVal"></span></label>
+      <input id="th" type="range" min="50" max="3000" step="10" value="400" />
+    </div>
+    <div class="slider">
+      <label>Silence hangover — <span class="val" id="hoVal"></span> ms</label>
+      <input id="ho" type="range" min="0" max="1000" step="20" value="200" />
+    </div>
+    <div class="slider">
+      <label>Volume scale — <span class="val" id="scVal"></span>×</label>
+      <input id="sc" type="range" min="1" max="20" step="0.5" value="3.5" />
+    </div>
+  </div>
+
+  <div class="wave-wrap">
+    <div class="wave-label">Mic input (volume over time)</div>
+    <canvas id="wave"></canvas>
+  </div>
+
+  <table>
+    <thead><tr><th>#</th><th>Gap (ms)</th><th>At (s)</th></tr></thead>
+    <tbody id="log"></tbody>
+  </table>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const statusEl = $("status");
+function setStatus(msg, cls = "") { statusEl.textContent = msg; statusEl.className = "status " + cls; }
+
+// ---------- audio state ----------
+let audioCtx = null, analyser = null, micStream = null, micSrc = null, rafId = null;
+let startTime = 0;
+let samples = [];            // {t: seconds, level: 0..1}
+let running = false;
+
+// ---------- gap detection state ----------
+// state machine over the RMS gate:
+//   "idle"     -> haven't heard speech yet
+//   "speaking" -> above threshold
+//   "silent"   -> dropped below threshold (past hangover); a gap is being timed
+let sState = "idle";
+let belowSince = null;       // when signal first dropped below threshold (s)
+let silenceStartT = null;    // the "last volume-down" instant a gap is counted from (s)
+let lastGap = null;          // ms
+let minGap = null, maxGap = null;
+let gapCount = 0;
+
+// ---------- tunables ----------
+let RMS_THRESHOLD = 400;     // int16-scale RMS gate for "speaking"
+let HANGOVER_S = 0.2;        // how long below threshold before we call it silence
+let VIS_SCALE = 3.5;         // waveform amplitude multiplier (visual only)
+
+const PX_PER_SEC = 60;       // horizontal scroll speed of the waveform
+const SUBDIVISIONS = 5;
+
+// ---------- canvas ----------
+const canvas = $("wave");
+const ctx = canvas.getContext("2d");
+function resizeCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  ctx.canvas.width = Math.round(canvas.clientWidth * dpr);
+  ctx.canvas.height = Math.round(canvas.clientHeight * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener("resize", resizeCanvas);
+resizeCanvas();
+
+// raw RMS in 0..1 of the analyser's time-domain signal
+function rawRms(an) {
+  if (!an) return 0;
+  const buf = new Uint8Array(an.fftSize);
+  an.getByteTimeDomainData(buf);
+  let sum = 0;
+  for (let i = 0; i < buf.length; i++) {
+    const v = (buf[i] - 128) / 128;
+    sum += v * v;
+  }
+  return Math.sqrt(sum / buf.length);
+}
+const visLevel = (raw) => Math.min(1, raw * VIS_SCALE);   // scaled for waveform visibility
+const rms16 = (raw) => raw * 32768;                 // int16-scale, for the threshold gate
+
+// scrolling waveform (newest on the right), seconds axis + minor gridlines
+function drawWave(now) {
+  const w = ctx.canvas.clientWidth, h = ctx.canvas.clientHeight;
+  const mid = h / 2;
+  ctx.clearRect(0, 0, w, h);
+  ctx.font = "11px ui-monospace, Menlo, monospace";
+  const firstSec = Math.max(0, Math.floor(now - w / PX_PER_SEC));
+  const lastSec = Math.ceil(now);
+
+  // minor gridlines
+  ctx.strokeStyle = "#11161f"; ctx.lineWidth = 1; ctx.beginPath();
+  for (let s = firstSec; s <= lastSec; s++) {
+    for (let k = 1; k < SUBDIVISIONS; k++) {
+      const x = w - (now - (s + k / SUBDIVISIONS)) * PX_PER_SEC;
+      if (x < 0 || x > w) continue;
+      ctx.moveTo(x, 0); ctx.lineTo(x, h);
+    }
+  }
+  ctx.stroke();
+
+  // major second lines + labels
+  ctx.strokeStyle = "#1c2230"; ctx.fillStyle = "#6e7681"; ctx.beginPath();
+  for (let s = firstSec; s <= lastSec; s++) {
+    const x = w - (now - s) * PX_PER_SEC;
+    ctx.moveTo(x, 0); ctx.lineTo(x, h);
+  }
+  ctx.stroke();
+  for (let s = firstSec; s <= lastSec; s++) {
+    const x = w - (now - s) * PX_PER_SEC;
+    ctx.fillText(s.toFixed(0) + "s", x + 3, h - 5);
+  }
+
+  // threshold guide lines (mirrored around center)
+  const thHalf = Math.min(1, RMS_THRESHOLD / 32768 * VIS_SCALE) * (h / 2 - 6);
+  ctx.strokeStyle = "#d2992255"; ctx.setLineDash([4, 4]); ctx.beginPath();
+  ctx.moveTo(0, mid - thHalf); ctx.lineTo(w, mid - thHalf);
+  ctx.moveTo(0, mid + thHalf); ctx.lineTo(w, mid + thHalf);
+  ctx.stroke(); ctx.setLineDash([]);
+
+  // center line
+  ctx.strokeStyle = "#30363d"; ctx.beginPath();
+  ctx.moveTo(0, mid); ctx.lineTo(w, mid); ctx.stroke();
+
+  // waveform bars, colored by whether the sample was above threshold
+  ctx.lineWidth = 2;
+  for (const sm of samples) {
+    const x = w - (now - sm.t) * PX_PER_SEC;
+    if (x < 0 || x > w) continue;
+    const half = sm.level * (h / 2 - 6);
+    ctx.strokeStyle = sm.hot ? "#3fb950" : "#30507a";
+    ctx.beginPath();
+    ctx.moveTo(x, mid - half); ctx.lineTo(x, mid + half);
+    ctx.stroke();
+  }
+}
+
+function pushGap(gapMs, atSec) {
+  lastGap = gapMs;
+  gapCount++;
+  minGap = (minGap == null) ? gapMs : Math.min(minGap, gapMs);
+  maxGap = (maxGap == null) ? gapMs : Math.max(maxGap, gapMs);
+  $("lastGap").textContent = Math.round(gapMs);
+  $("minGap").textContent = Math.round(minGap);
+  $("maxGap").textContent = Math.round(maxGap);
+  $("count").textContent = gapCount;
+  const tr = document.createElement("tr");
+  tr.innerHTML = `<td>${gapCount}</td><td>${Math.round(gapMs)}</td><td>${atSec.toFixed(1)}</td>`;
+  $("log").prepend(tr);
+}
+
+function draw() {
+  const now = (performance.now() - startTime) / 1000;
+  const raw = rawRms(analyser);
+  const r16 = rms16(raw);
+  const hot = r16 > RMS_THRESHOLD;
+  samples.push({ t: now, level: visLevel(raw), hot });
+
+  $("level").textContent = "level " + Math.round(r16);
+
+  // --- gap state machine ---
+  if (hot) {
+    if (sState === "silent") {
+      // first new volume-up after a measured silence -> close the gap
+      const gapMs = (now - silenceStartT) * 1000;
+      pushGap(gapMs, now);
+    }
+    sState = "speaking";
+    belowSince = null;
+  } else {
+    if (sState === "speaking") {
+      if (belowSince == null) belowSince = now;              // moment volume dropped
+      else if (now - belowSince >= HANGOVER_S) {
+        sState = "silent";
+        silenceStartT = belowSince;                          // count gap from the drop
+      }
+    }
+  }
+
+  // live UI: state pill + current-gap readout
+  const gapCard = $("gapCard");
+  if (sState === "silent") {
+    $("state").textContent = "silent"; $("state").className = "pill sil";
+    $("gapVal").textContent = Math.round((now - silenceStartT) * 1000);
+    gapCard.className = "card gap live";
+  } else if (sState === "speaking") {
+    $("state").textContent = "speaking"; $("state").className = "pill spk";
+    $("gapVal").textContent = lastGap == null ? "—" : Math.round(lastGap);
+    gapCard.className = "card gap done";
+  } else {
+    $("state").textContent = "idle"; $("state").className = "pill";
+    $("gapVal").textContent = "—";
+    gapCard.className = "card gap";
+  }
+
+  // drop samples scrolled off the left edge
+  const oldest = now - canvas.clientWidth / PX_PER_SEC - 1;
+  while (samples.length && samples[0].t < oldest) samples.shift();
+
+  drawWave(now);
+  rafId = requestAnimationFrame(draw);
+}
+
+// ---------- session ----------
+async function start() {
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    });
+  } catch (e) {
+    setStatus("Mic permission denied: " + e.message, "err");
+    return;
+  }
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  await audioCtx.resume();
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 2048;
+  micSrc = audioCtx.createMediaStreamSource(micStream);
+  micSrc.connect(analyser);   // analyser is a sink only — no playback, no echo
+
+  resetMeters();
+  running = true;
+  $("start").disabled = true;
+  $("stop").disabled = false;
+  $("reset").disabled = false;
+  setStatus("Listening — speak, then pause to time the gap until you speak again.", "ok");
+  startTime = performance.now();
+  draw();
+}
+
+function resetMeters() {
+  samples = [];
+  sState = "idle"; belowSince = null; silenceStartT = null;
+  lastGap = null; minGap = null; maxGap = null; gapCount = 0;
+  $("gapVal").textContent = "—"; $("lastGap").textContent = "—";
+  $("minGap").textContent = "—"; $("maxGap").textContent = "—"; $("count").textContent = "0";
+  $("log").innerHTML = "";
+  startTime = performance.now();
+}
+
+function stop() {
+  running = false;
+  if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+  if (micSrc) { try { micSrc.disconnect(); } catch {} micSrc = null; }
+  if (micStream) { try { micStream.getTracks().forEach((t) => t.stop()); } catch {} micStream = null; }
+  if (audioCtx) { try { audioCtx.close(); } catch {} audioCtx = null; }
+  analyser = null;
+  $("start").disabled = false;
+  $("stop").disabled = true;
+  $("reset").disabled = true;
+  $("state").textContent = "idle"; $("state").className = "pill";
+  setStatus("Stopped.", "");
+}
+
+// ---------- controls ----------
+function syncTh() { RMS_THRESHOLD = +$("th").value; $("thVal").textContent = RMS_THRESHOLD; }
+function syncHo() { HANGOVER_S = +$("ho").value / 1000; $("hoVal").textContent = $("ho").value; }
+function syncSc() { VIS_SCALE = +$("sc").value; $("scVal").textContent = VIS_SCALE; }
+$("th").addEventListener("input", syncTh);
+$("ho").addEventListener("input", syncHo);
+$("sc").addEventListener("input", syncSc);
+syncTh(); syncHo(); syncSc();
+
+$("start").addEventListener("click", () => start().catch((e) => setStatus(e.message, "err")));
+$("stop").addEventListener("click", stop);
+$("reset").addEventListener("click", () => { if (running) resetMeters(); });
+</script>
+</body>
+</html>
