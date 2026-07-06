@@ -53,7 +53,14 @@ mic works there.
 
 ## How the gap timing works
 
-A small state machine runs over the RMS gate each animation frame:
+Gap timing runs on the **audio thread** inside an `AudioWorklet`, not on the
+render loop. The worklet computes RMS once per 128‑sample render quantum
+(~2.7 ms at 48 kHz) and times transitions against `currentFrame / sampleRate`,
+so threshold crossings are resolved to one quantum instead of one animation
+frame. The main thread only draws the waveform and mirrors the state the worklet
+posts back.
+
+A small state machine runs over the RMS gate each quantum:
 
 - `idle` → no speech heard yet.
 - `speaking` → level is above the threshold.
@@ -62,3 +69,13 @@ A small state machine runs over the RMS gate each animation frame:
 
 When the level next rises above threshold, the gap closes: `gap = up_time −
 drop_time`, recorded in the stats and log.
+
+### Timing accuracy
+
+Resolution is roughly **one render quantum (~2.7 ms @ 48 kHz)** — far tighter
+than the previous `requestAnimationFrame` approach (~16 ms per frame plus a
+~43 ms analyser averaging window). The remaining floor is the browser/OS mic
+capture buffer (tens of ms of fixed latency), which is inherent to
+`getUserMedia` and cancels out when measuring *gap durations* rather than
+absolute onset times. The `AnalyserNode` is kept only to drive the visual
+waveform.

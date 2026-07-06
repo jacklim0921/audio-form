@@ -127,21 +127,75 @@ function setStatus(msg, cls = "") { statusEl.textContent = msg; statusEl.classNa
 
 // ---------- audio state ----------
 let audioCtx = null, analyser = null, micStream = null, micSrc = null, rafId = null;
+let gateNode = null;         // AudioWorklet doing sample-accurate RMS gating
+let workletURL = null;
 let startTime = 0;
 let samples = [];            // {t: seconds, level: 0..1}
 let running = false;
 
 // ---------- gap detection state ----------
-// state machine over the RMS gate:
+// The gap state machine runs on the AUDIO thread (see workletSource) at
+// render-quantum resolution (~2.7 ms @ 48 kHz), not on requestAnimationFrame.
+// The main thread only mirrors state posted back from the worklet:
 //   "idle"     -> haven't heard speech yet
 //   "speaking" -> above threshold
 //   "silent"   -> dropped below threshold (past hangover); a gap is being timed
 let sState = "idle";
-let belowSince = null;       // when signal first dropped below threshold (s)
-let silenceStartT = null;    // the "last volume-down" instant a gap is counted from (s)
+let silenceStartAT = null;   // audioContext-time (s) the current gap is counted from
 let lastGap = null;          // ms
 let minGap = null, maxGap = null;
 let gapCount = 0;
+
+// ---------- audio-thread gate (AudioWorkletProcessor) ----------
+// Computes RMS per 128-sample quantum and times gaps against currentFrame/sampleRate,
+// so threshold crossings are resolved to one quantum instead of one animation frame.
+const workletSource = `
+class RMSGate extends AudioWorkletProcessor {
+  constructor(opts) {
+    super();
+    const o = opts.processorOptions || {};
+    this.threshold = o.threshold || 0;      // int16-scale RMS gate
+    this.hangoverS = o.hangoverS || 0;      // seconds below threshold before "silent"
+    this.state = "idle";
+    this.belowSinceFrame = null;
+    this.silenceStartFrame = null;
+    this.port.onmessage = (e) => {
+      const m = e.data;
+      if (m.type === "threshold") this.threshold = m.value;
+      else if (m.type === "hangover") this.hangoverS = m.seconds;
+      else if (m.type === "reset") {
+        this.state = "idle"; this.belowSinceFrame = null; this.silenceStartFrame = null;
+      }
+    };
+  }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch) return true;
+    let sum = 0;
+    for (let i = 0; i < ch.length; i++) sum += ch[i] * ch[i];
+    const r16 = Math.sqrt(sum / ch.length) * 32768;
+    const hot = r16 > this.threshold;
+    if (hot) {
+      if (this.state === "silent") {
+        const gapMs = (currentFrame - this.silenceStartFrame) / sampleRate * 1000;
+        this.port.postMessage({ type: "gap", gapMs, atSec: currentFrame / sampleRate });
+      }
+      if (this.state !== "speaking") this.port.postMessage({ type: "state", state: "speaking" });
+      this.state = "speaking";
+      this.belowSinceFrame = null;
+    } else if (this.state === "speaking") {
+      if (this.belowSinceFrame == null) this.belowSinceFrame = currentFrame;
+      else if ((currentFrame - this.belowSinceFrame) / sampleRate >= this.hangoverS) {
+        this.state = "silent";
+        this.silenceStartFrame = this.belowSinceFrame;
+        this.port.postMessage({ type: "state", state: "silent", silenceStartAT: this.silenceStartFrame / sampleRate });
+      }
+    }
+    return true;
+  }
+}
+registerProcessor("rms-gate", RMSGate);
+`;
 
 // ---------- tunables ----------
 let RMS_THRESHOLD = 400;     // int16-scale RMS gate for "speaking"
@@ -248,39 +302,36 @@ function pushGap(gapMs, atSec) {
   $("log").prepend(tr);
 }
 
+// messages from the audio-thread gate
+function handleGateMessage(e) {
+  const m = e.data;
+  if (m.type === "gap") {
+    pushGap(m.gapMs, m.atSec);
+    sState = "speaking";
+  } else if (m.type === "state") {
+    sState = m.state;
+    if (m.state === "silent") silenceStartAT = m.silenceStartAT;
+  }
+}
+
 function draw() {
   const now = (performance.now() - startTime) / 1000;
   const raw = rawRms(analyser);
   const r16 = rms16(raw);
-  const hot = r16 > RMS_THRESHOLD;
+  const hot = r16 > RMS_THRESHOLD;   // visual only; authoritative gating is in the worklet
   samples.push({ t: now, level: visLevel(raw), hot });
 
   $("level").textContent = "level " + Math.round(r16);
 
-  // --- gap state machine ---
-  if (hot) {
-    if (sState === "silent") {
-      // first new volume-up after a measured silence -> close the gap
-      const gapMs = (now - silenceStartT) * 1000;
-      pushGap(gapMs, now);
-    }
-    sState = "speaking";
-    belowSince = null;
-  } else {
-    if (sState === "speaking") {
-      if (belowSince == null) belowSince = now;              // moment volume dropped
-      else if (now - belowSince >= HANGOVER_S) {
-        sState = "silent";
-        silenceStartT = belowSince;                          // count gap from the drop
-      }
-    }
-  }
+  // gap detection now happens on the audio thread; the main thread just renders
+  // the state the worklet posts back (see handleGateMessage / start()).
 
   // live UI: state pill + current-gap readout
   const gapCard = $("gapCard");
   if (sState === "silent") {
     $("state").textContent = "silent"; $("state").className = "pill sil";
-    $("gapVal").textContent = Math.round((now - silenceStartT) * 1000);
+    const liveGap = audioCtx ? (audioCtx.currentTime - silenceStartAT) * 1000 : 0;
+    $("gapVal").textContent = Math.round(liveGap);
     gapCard.className = "card gap live";
   } else if (sState === "speaking") {
     $("state").textContent = "speaking"; $("state").className = "pill spk";
@@ -315,7 +366,19 @@ async function start() {
   analyser = audioCtx.createAnalyser();
   analyser.fftSize = 2048;
   micSrc = audioCtx.createMediaStreamSource(micStream);
-  micSrc.connect(analyser);   // analyser is a sink only — no playback, no echo
+  micSrc.connect(analyser);   // analyser drives the visual waveform only
+
+  // load the audio-thread gate and route the mic into it
+  if (!workletURL) {
+    workletURL = URL.createObjectURL(new Blob([workletSource], { type: "application/javascript" }));
+  }
+  await audioCtx.audioWorklet.addModule(workletURL);
+  gateNode = new AudioWorkletNode(audioCtx, "rms-gate", {
+    processorOptions: { threshold: RMS_THRESHOLD, hangoverS: HANGOVER_S },
+  });
+  gateNode.port.onmessage = handleGateMessage;
+  micSrc.connect(gateNode);
+  gateNode.connect(audioCtx.destination);   // output is left silent — this only keeps the node scheduled
 
   resetMeters();
   running = true;
@@ -329,8 +392,9 @@ async function start() {
 
 function resetMeters() {
   samples = [];
-  sState = "idle"; belowSince = null; silenceStartT = null;
+  sState = "idle"; silenceStartAT = null;
   lastGap = null; minGap = null; maxGap = null; gapCount = 0;
+  if (gateNode) gateNode.port.postMessage({ type: "reset" });
   $("gapVal").textContent = "—"; $("lastGap").textContent = "—";
   $("minGap").textContent = "—"; $("maxGap").textContent = "—"; $("count").textContent = "0";
   $("log").innerHTML = "";
@@ -340,6 +404,7 @@ function resetMeters() {
 function stop() {
   running = false;
   if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+  if (gateNode) { try { gateNode.disconnect(); } catch {} gateNode.port.onmessage = null; gateNode = null; }
   if (micSrc) { try { micSrc.disconnect(); } catch {} micSrc = null; }
   if (micStream) { try { micStream.getTracks().forEach((t) => t.stop()); } catch {} micStream = null; }
   if (audioCtx) { try { audioCtx.close(); } catch {} audioCtx = null; }
@@ -352,8 +417,14 @@ function stop() {
 }
 
 // ---------- controls ----------
-function syncTh() { RMS_THRESHOLD = +$("th").value; $("thVal").textContent = RMS_THRESHOLD; }
-function syncHo() { HANGOVER_S = +$("ho").value / 1000; $("hoVal").textContent = $("ho").value; }
+function syncTh() {
+  RMS_THRESHOLD = +$("th").value; $("thVal").textContent = RMS_THRESHOLD;
+  if (gateNode) gateNode.port.postMessage({ type: "threshold", value: RMS_THRESHOLD });
+}
+function syncHo() {
+  HANGOVER_S = +$("ho").value / 1000; $("hoVal").textContent = $("ho").value;
+  if (gateNode) gateNode.port.postMessage({ type: "hangover", seconds: HANGOVER_S });
+}
 function syncSc() { VIS_SCALE = +$("sc").value; $("scVal").textContent = VIS_SCALE; }
 $("th").addEventListener("input", syncTh);
 $("ho").addEventListener("input", syncHo);
